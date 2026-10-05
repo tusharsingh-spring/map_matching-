@@ -14,6 +14,7 @@ from PIL import Image, UnidentifiedImageError
 from werkzeug.exceptions import HTTPException
 
 app = Flask(__name__)
+app.logger.setLevel('INFO')
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
 engine = Localizer(dino=os.environ.get('USE_DINO') == '1')
 rng = np.random.default_rng(2026)
