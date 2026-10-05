@@ -5,6 +5,8 @@ import io
 import threading
 import time
 import uuid
+import json
+import urllib.request
 import cv2
 import numpy as np
 from flask import Flask, request, jsonify, render_template
@@ -18,6 +20,44 @@ rng = np.random.default_rng(2026)
 match_lock = threading.Lock()
 cv2.setNumThreads(1)
 allowed_origins = {s.strip() for s in os.environ.get('DASHBOARD_ORIGINS', '').split(',') if s.strip()}
+
+# Optional: report every result to the Indradhanu command centre, so a frame
+# localized here shows up in its live log. Off unless the URL is set.
+WEBHOOK_URL = os.environ.get('INDRADHANU_WEBHOOK_URL', '').strip()
+WEBHOOK_KEY = os.environ.get('INDRADHANU_WEBHOOK_KEY', '').strip()
+DRONE_ID = os.environ.get('DRONE_ID', 'drone-1').strip() or 'drone-1'
+SUMMARY_KEYS = ('accepted', 'image', 'coordinates', 'inliers', 'error', 'reason', 'processing_ms',
+                'request_id', 'mode', 'correct_image', 'api_version')
+
+def thumbnail(image, side=240):
+    h, w = image.shape[:2]
+    scale = side / max(h, w)
+    if scale < 1:
+        image = cv2.resize(image, (max(1, int(w * scale)), max(1, int(h * scale))), interpolation=cv2.INTER_AREA)
+    ok, buf = cv2.imencode('.jpg', image, [cv2.IMWRITE_JPEG_QUALITY, 70])
+    return 'data:image/jpeg;base64,' + base64.b64encode(buf).decode() if ok else None
+
+def notify(result, query, source):
+    # The command centre's own uploads come through its API, which records them itself.
+    if not WEBHOOK_URL or request.headers.get('X-Indradhanu-Source') == 'console':
+        return
+    summary = {k: result[k] for k in SUMMARY_KEYS if k in result}
+    try:
+        thumb = thumbnail(query)
+    except Exception:
+        thumb = None
+    body = json.dumps({'result': summary, 'source': source, 'drone': DRONE_ID, 'thumb': thumb}, default=float).encode()
+    headers = {'Content-Type': 'application/json', 'User-Agent': 'map-patch-finder/1'}
+    if WEBHOOK_KEY:
+        headers['X-Mesh-Gateway-Key'] = WEBHOOK_KEY
+
+    def send():
+        try:
+            with urllib.request.urlopen(urllib.request.Request(WEBHOOK_URL, data=body, headers=headers, method='POST'), timeout=20) as reply:
+                app.logger.info('Indradhanu webhook delivered: HTTP %s, request_id=%s', reply.status, summary.get('request_id'))
+        except Exception as e:
+            app.logger.warning('Indradhanu webhook failed: %s', e)
+    threading.Thread(target=send, daemon=True).start()
 
 def encoded(image):
     return 'data:image/png;base64,' + base64.b64encode(cv2.imencode('.png', image)[1]).decode()
@@ -44,6 +84,7 @@ def response(query, truth=None, include_images=True):
         result['correct_image'] = result.get('image') == truth['source']
         if result.get('accepted') and result['correct_image']:
             result['corner_error_px'] = float(np.linalg.norm(np.array(result['polygon']) - truth['polygon'], axis=1).mean())
+    notify(result, query, 'demo' if truth else 'upload')
     return jsonify(result)
 
 @app.after_request
@@ -52,7 +93,7 @@ def cors(response):
     if request.path.startswith('/api/') and origin in allowed_origins:
         response.headers['Access-Control-Allow-Origin'] = origin
         response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
-        response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, X-Indradhanu-Source'
         response.vary.add('Origin')
     return response
 
